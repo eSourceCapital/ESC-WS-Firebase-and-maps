@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <style>
+        #map {
+            height: 100%;
+        }
+
+        /* Opcional: tamaño completo. */
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+    </style>
+
+    <!-- Importamos firebase (8.10)-->
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-auth.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-firestore.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+
+</head>
+
+<body>
+    <!-- Agregamos el div del mapa-->
+    <div id="map"></div>
+
+
+
+    <script defer
+        src="https://maps.googleapis.com/maps/api/js?key=[API KEY]&libraries=visualization&callback=initMap">
+        </script>
+
+    <script>
+        /**
+         * Firebase config block.
+         */
+
+        
+
+
+
+
+        firebase.initializeApp(firebaseConfig);
+        var db = firebase.firestore();
+
+        /**
+         * objeto a guardar en firebase
+         */
+        var data = { sender: null, timestamp: null, lat: null, lng: null };
+
+        function makeInfoBox(controlDiv, map) {
+            // CSS
+            var controlUI = document.createElement('div');
+            controlUI.style.boxShadow = 'rgba(0, 0, 0, 0.298039) 0px 1px 4px -1px';
+            controlUI.style.backgroundColor = '#fff';
+            controlUI.style.border = '2px solid #fff';
+            controlUI.style.borderRadius = '2px';
+            controlUI.style.marginBottom = '22px';
+            controlUI.style.marginTop = '10px';
+            controlUI.style.textAlign = 'center';
+            controlDiv.appendChild(controlUI);
+
+            // CSS: mensaje.
+            var controlText = document.createElement('div');
+            controlText.style.color = 'rgb(25,25,25)';
+            controlText.style.fontFamily = 'Roboto,Arial,sans-serif';
+            controlText.style.fontSize = '100%';
+            controlText.style.padding = '6px';
+            controlText.textContent = 'el mapa muestra los últimos 10 min.';
+            controlUI.appendChild(controlText);
+        }
+
+        /**
+        * Función Principal, se llama a la autenticación
+        * @param {function()} onAuthSuccess - se llama cunado la autenticación fue exitosa.
+        */
+        function initAuthentication(onAuthSuccess) {
+            firebase.auth().signInAnonymously().catch(function (error) {
+                console.log(error.code + ', ' + error.message);
+            }, { remember: 'sessionOnly' });
+
+            firebase.auth().onAuthStateChanged(function (user) {
+                if (user) {
+                    data.sender = user.uid;
+                    onAuthSuccess();
+                }
+            });
+        }
+
+        /**
+         * Creamos un objeto mapa con un listener de clicks y un mapa de calor.
+         */
+        function initMap() {
+            var map = new google.maps.Map(document.getElementById('map'), {
+                center: { lat: 0, lng: 0 },
+                zoom: 3,
+                disableDoubleClickZoom: true,
+                streetViewControl: false,
+            });
+
+            // creamos un div para el infowindows
+            var infoBoxDiv = document.createElement('div');
+            makeInfoBox(infoBoxDiv, map);
+            map.controls[google.maps.ControlPosition.TOP_CENTER].push(infoBoxDiv);
+
+            // Agregamos el Listener.
+            map.addListener('click', function (e) {
+                data.lat = e.latLng.lat();
+                data.lng = e.latLng.lng();
+                addToFirebase(data);
+            });
+
+            // Creamos el mapa de calor.
+            var heatmap = new google.maps.visualization.HeatmapLayer({
+                data: [],
+                map: map,
+                radius: 16
+            });
+
+            // mandamos a llamar la autenticación
+            initAuthentication(initFirebase.bind(undefined, heatmap));
+        }
+
+        /**
+         * Configure un Firebase con eliminación de clics anteriores a expiryMs
+         * @param {!google.maps.visualization.HeatmapLayer} heatmap Mapa de calor
+         */
+        function initFirebase(heatmap) {
+
+            // 10 minutos antes.
+            var startTime = new Date().getTime() - (60 * 10 * 1000);
+
+            // Referencia a los clicks en Firebase.
+            var clicks = firebase.database().ref('clicks');
+
+            // Escuchamos clicks y los agregamos al mapa de calor.
+            clicks.orderByChild('timestamp').startAt(startTime).on('child_added',
+                function (snapshot) {
+                    // Obtenemos el click de firebase.
+                    var newPosition = snapshot.val();
+                    var point = new google.maps.LatLng(newPosition.lat, newPosition.lng);
+                    var elapsedMs = Date.now() - newPosition.timestamp;
+
+                    // Agregamos el punto al mapa de calor.
+                    heatmap.getData().push(point);
+
+                    // Solicitamos entradas dentro de los ultimos 10 minutos.
+                    var expiryMs = Math.max(60 * 10 * 1000 - elapsedMs, 0);
+
+                    // Configure el tiempo de espera del cliente para eliminar el punto después de un tiempo determinado.
+                    window.setTimeout(function () {
+                        // Eliminamos los puntos
+                        snapshot.ref.remove();
+                    }, expiryMs);
+                }
+            );
+
+            // Elimine los datos antiguos del mapa de calor cuando se elimine un punto de firebase.
+            clicks.on('child_removed', function (snapshot, prevChildKey) {
+                var heatmapData = heatmap.getData();
+                var i = 0;
+                while (snapshot.val().lat != heatmapData.getAt(i).lat()
+                    || snapshot.val().lng != heatmapData.getAt(i).lng()) {
+                    i++;
+                }
+                heatmapData.removeAt(i);
+            });
+        }
+
+        /**
+         * Actualiza la ruta last_message/ con el timestamp actual.
+         * @param {function(Date)} addClick después de actualizar el timestamp del último mensaje,
+         *     esta función se llama con el timestamp actual para agregar el
+         *     click a firebase.
+         */
+        function getTimestamp(addClick) {
+            var ref = firebase.database().ref('last_message/' + data.sender);
+
+            ref.onDisconnect().remove();  // Elimina la referenccia de firebase .
+
+            // Establecer el timestamp.
+            ref.set(firebase.database.ServerValue.TIMESTAMP, function (err) {
+                if (err) {  
+                    console.log(err);
+                } else { 
+                    ref.once('value', function (snap) {
+                        addClick(snap.val());  // Agrega el click con el timestamp.
+                    }, function (err) {
+                        console.warn(err);
+                    });
+                }
+            });
+        }
+
+        /**
+         * Agregar clicks a firebase.
+         * @param {Object} data Los datos a agregar a firebase.
+         *     Contiene lat, lng, sender (quien envia) y el timestamp (fecha y hora).
+         */
+        function addToFirebase(data) {
+            getTimestamp(function (timestamp) {
+                // agrega el timestamp.
+                data.timestamp = timestamp;
+                var ref = firebase.database().ref('clicks').push(data, function (err) {
+                    if (err) {  
+                        console.warn(err);
+                    }
+                });
+            });
+        }
+    </script>
+</body>
+
+</html>
